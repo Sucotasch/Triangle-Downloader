@@ -277,11 +277,19 @@
         dbg('menuSetQuality: selected auto');
         return true;
       }
-      // Prefer the exact "1440p" entry over "1440p60"; accept any variant that starts
-      // with the target height (labels normalize to digits: "1440p60" → "144060").
+      // Prefer the PLAIN entry ("1080p") over "1080p Premium" — the Premium variant is
+      // subscription-gated and selecting it when unavailable fails — and over
+      // "1080p60". Accept any variant that starts with the target height (labels
+      // normalize to digits: "1080p60" → "108060"). Premium is only a last resort
+      // (subscribers with no plain entry at that height).
       const norm = (t) => String(t).replace(/[^0-9]/g, '');
-      const target = qItems.filter(it => norm(menuItemLabel(it)) === String(sel))[0]
-                  || qItems.filter(it => norm(menuItemLabel(it)).startsWith(String(sel)))[0];
+      const label = (it) => menuItemLabel(it);
+      const plain = qItems.filter(it => !/premium|премиум/i.test(label(it)));
+      const exact = plain.filter(it => norm(label(it)) === String(sel))[0];
+      const target = exact
+                  || plain.filter(it => norm(label(it)).startsWith(String(sel)))[0]
+                  || qItems.filter(it => norm(label(it)) === String(sel))[0]
+                  || qItems.filter(it => norm(label(it)).startsWith(String(sel)))[0];
       if (!target) { closeIfOpen(); dbg('menuSetQuality: no entry for', sel, qItems.map(menuItemLabel)); return false; }
       target.click();
       await sleep(250);

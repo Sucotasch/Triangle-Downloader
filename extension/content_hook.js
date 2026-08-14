@@ -409,7 +409,13 @@
     //     start.
     const preSeek = capStart > 10 ? (dur - 5 > 10 ? dur - 5 : 0) : Math.min(35, Math.max(1, dur - 5));
     try {
-      const lowH = lowestAvailableHeight();
+      // The flush (switch to the lowest quality) is only needed when the player is ALREADY
+      // at the requested quality — then the target switch below would be a no-op and the
+      // stale buffer would survive. When the current quality differs, the target switch
+      // itself re-fetches at a different itag and evicts the old buffer, so the flush
+      // dance is skipped (it visibly delayed every download).
+      const flushNeeded = !prevKey || prevKey === '?' || prevKey === targetQ;
+      const lowH = flushNeeded ? lowestAvailableHeight() : 0;
       if (lowH) {
         try { await menuSetQuality(lowH); } catch (e) {}
         await sleep(500); // let the flush switch start (recording is still OFF)

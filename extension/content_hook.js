@@ -73,6 +73,14 @@
     if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
     return null;
   }
+  // Byte-identical init segments mean the player re-appended the SAME stream (e.g. a
+  // buffer-eviction recovery) — the media before and after is contiguous and the same
+  // codec, so the track can be glued. A different init means a real quality switch.
+  function sameBytes(a, b) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
 
   // Does this appended chunk begin a fresh track file? A valid concatenation must
   // start at the init segment, so we only begin recording a track from the chunk
@@ -111,23 +119,40 @@
           if (init) store.lastInit[kind] = { bytes: u8.slice(), mime: this.__ytdlMime || '' };
           if (store.capturing) {
             if (init) {
-              // A fresh init mid-capture means the player cleared its buffer and
-              // restarted (remove() + new init). Everything before is no longer
-              // contiguous, so start the track over at the new init instead of
-              // gluing two init segments together (which would corrupt the file).
-              // If the track already had data, the restart CUT it short — count it so
-              // the result is honestly reported as incomplete.
-              if (store.tracks[kind]) {
-                store.restarts[kind] = (store.restarts[kind] || 0) + 1;
+              const t = store.tracks[kind];
+              if (t && t.parts.length) {
+                // A fresh init mid-capture means the player cleared its buffer and
+                // restarted (remove() + new init). This is usually a buffer-eviction
+                // recovery at the SAME quality (the quality is never re-applied during
+                // capture), NOT a quality switch. When the new init is byte-identical
+                // to the track's own init, the stream before and after the reset is the
+                // same codec and contiguous in time — so we DROP the redundant init and
+                // keep appending, and the captured file stays whole (a seam, not a cut).
+                // A DIFFERENT init means a real quality switch: the streams can't be
+                // glued, so the track starts over (CUT) and it is counted so the result
+                // is honestly reported as incomplete.
+                if (sameBytes(u8, t.initBytes)) {
+                  t.seams = (t.seams || 0) + 1;
+                  dbg('capture re-init', kind, 'same-stream — glued (seam)', t.seams, 'bytes', totalCaptured());
+                } else {
+                  store.restarts[kind] = (store.restarts[kind] || 0) + 1;
+                  store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()], initBytes: u8.slice() };
+                  dbg('capture re-init', kind, 'DIFFERENT stream — track cut (restart)', store.restarts[kind]);
+                }
+              } else {
+                store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()], initBytes: u8.slice() };
               }
-              store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()] };
             } else {
               const t = store.tracks[kind];
               if (t) {
                 t.parts.push(u8.slice());
               } else if (store.lastInit[kind]) {
                 // media arrived without a fresh init → seed the track with the stored init
-                store.tracks[kind] = { mime: store.lastInit[kind].mime, parts: [store.lastInit[kind].bytes, u8.slice()] };
+                store.tracks[kind] = {
+                  mime: store.lastInit[kind].mime,
+                  parts: [store.lastInit[kind].bytes, u8.slice()],
+                  initBytes: store.lastInit[kind].bytes,
+                };
               }
               // else: no init available yet — skip until one appears
             }
@@ -459,6 +484,7 @@
     let cursor = capStart, stall = 0;
     let complete = false;
     let actualH = 0;
+    let seamCount = 0;           // same-stream re-inits glued into the track (not cuts)
     const span = Math.max(0.1, capEnd - capStart);
     const started = Date.now();
     try {
@@ -495,13 +521,16 @@
       }
       capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
       actualH = servedHeight(); // resolution the player actually served during capture
-      // Buffer-eviction guard: if the browser evicted the START of the buffered range
-      // (memory pressure), the per-track edges can still reach capEnd while the captured
-      // track is missing [capStart, evictPoint] — no init involved, so no restart was
-      // counted, and a full-video download skips trimming → would silently ship a short
-      // file. Completing therefore also requires the video buffer to still cover the
-      // capture start.
-      if (complete && needVideo) {
+      seamCount = ((store.tracks.video && store.tracks.video.seams) || 0) +
+                  ((store.tracks.audio && store.tracks.audio.seams) || 0);
+      // Buffer-eviction guard: only meaningful when the capture had NO mid-capture
+      // re-inits. If the browser evicted the START of the buffered range and the player
+      // re-fetched WITHOUT re-initing, the re-fetched bytes duplicate already-captured
+      // data and a full-video download (no trimming) would silently ship a corrupt file —
+      // so complete only when the video buffer still covers the capture start. A
+      // same-stream re-init (seam) is glued and keeps the bytes whole; a different-stream
+      // re-init is counted as a restart below and already forces incomplete.
+      if (complete && needVideo && seamCount === 0) {
         try {
           const sb = store.sb.video;
           if (sb) {
@@ -524,15 +553,16 @@
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     // A mid-capture re-init (quality switch / buffer flush) REPLACED a track, so part of
-    // the range is missing from the file — report honestly as incomplete.
+    // the range is missing from the file — report honestly as incomplete. Same-stream
+    // re-inits (seams) were glued and do NOT cut the file.
     const restartCount = (store.restarts.video || 0) + (store.restarts.audio || 0);
     if (restartCount > 0) complete = false;
     // NOTE: restarts/bytes are logged as SEPARATE arguments because Chrome's console
     // collapses an object into "{...}" when copied, hiding the values.
-    dbg('capture', { targetQ, requestedH: wantRes, servedH: actualH, complete }, 'restarts:', restartCount, 'bytes:', totalCaptured());
+    dbg('capture', { targetQ, requestedH: wantRes, servedH: actualH, complete, seams: seamCount }, 'restarts:', restartCount, 'bytes:', totalCaptured());
 
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount };
+    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount, seams: seamCount };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------

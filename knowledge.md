@@ -132,9 +132,18 @@ All code lives in `extension/`. The extension is split into three contexts commu
   seconds long (symptom: the file freezes on the last decoded frame and is tiny).
   `content_hook.js` stores the latest SourceBuffer per kind in `store.sb` and drives hops and
   completion off `trackEdge()` per track; completion requires BOTH raw edges to reach the end.
-- **Mid-capture re-init CUTS the track**: a fresh init while recording replaces that track
-  (`store.restarts` counter, counted only when the track already had data). Any restart ⇒
-  `complete:false`, so the UI warns "во время захвата переключилось качество".
+- **Mid-capture re-init: same-stream = seam (glued), different-stream = restart (cut)**.
+  A fresh init while recording usually means the SABR player reset its SourceBuffer —
+  typically a buffer-eviction recovery or a stream restart after an edge-seek, both at the
+  SAME quality (the quality is never re-applied during capture). The new init is compared
+  byte-for-byte with the track's own init: identical ⇒ the stream before/after is the same
+  codec and contiguous, so the redundant init is DROPPED and the media keeps appending
+  (`t.seams`, glued — the file stays whole, NO warning); different ⇒ a real quality switch,
+  the track is replaced and counted (`store.restarts`) ⇒ `complete:false`, UI warns
+  "во время захвата переключилось качество". The eviction guard only applies when there
+  were NO seams (a re-fetch without a re-init can duplicate bytes; a glued capture is whole
+  by construction). Diagnostics: `[YTDL] capture re-init <kind> same-stream/DIFFERENT`, and
+  the final `[YTDL] capture {…, seams} restarts: N` line distinguishes the two.
 - **Conflicting extensions can force-reset the quality (known external cause, confirmed
   live)**: "YouTube Auto HD + FPS" and similar quality-forcing extensions keep calling the
   player's quality API, switching it back to AUTO/range mode and OVERRIDING our native-menu

@@ -123,6 +123,12 @@ All code lives in `extension/`. The extension is split into three contexts commu
   of setting, and it broke the user's wide layout). The download reply still carries the
   actually-served `height`; `content_ui.js` names the file after the real resolution and
   toasts "плеер отдал Np вместо Mp" as a safety net for external interference.
+- **The player's pre-download quality is restored after the capture** (`restoreQuality`):
+  `playthrough()` remembers `getPlaybackQuality()` before touching anything (`prevKey`)
+  and, on EVERY exit path (success, capture failure, pre-recording failure), re-selects
+  that quality via the native menu (`menuSetQuality` accepts a height or the string
+  'auto' → clicks "Автоматически"; unknown keys are skipped). Without this the player
+  stayed at the downloaded resolution (e.g. 2160p) after the user had been on 720p.
 - **Capture loop must use PER-TRACK buffered edges, never the union**: `video.buffered` is the
   union across SourceBuffers, and at high bitrates the audio buffer extends far beyond the
   video one — the union edge would "complete" a capture whose VIDEO track is only a few

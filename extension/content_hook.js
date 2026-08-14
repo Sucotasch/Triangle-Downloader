@@ -215,22 +215,23 @@
   // Actual resolution height per quality key — what the native menu labels items with
   // ("1440p"/"2160p"). menuSetQuality matches menu text against THIS, not RES_H (a
   // verification threshold).
-  const RES_NAME = { hd2160: 2160, hd1440: 1440, hd1080: 1080, hd720: 720, medium: 360, small: 240, tiny: 144 };
+  const RES_NAME = { hd2160: 2160, hd1440: 1440, hd1080: 1080, hd720: 720, large: 480, medium: 360, small: 240, tiny: 144 };
   function servedHeight() { try { return video().videoHeight || 0; } catch (e) { return 0; } }
 
   // Force the quality the way the user does it: through the native settings menu — the
   // ONLY reliable quality switcher in the SABR player (the JS API, fixed or range, is
   // ignored for switching: users had to set the resolution by hand for downloads to
-  // work). Best-effort: returns true when the target was selected, false when the menu
-  // wasn't reachable. NO state toggles here — we only ever open the menu, pick a quality,
-  // and close it (the user's layout is left exactly as it was).
+  // work). `sel` is a numeric height (e.g. 1440) or the string 'auto' (re-selects
+  // "Автоматически"). Best-effort: returns true when the target was selected, false when
+  // the menu wasn't reachable. NO state toggles here — we only ever open the menu, pick a
+  // quality, and close it (the user's layout is left exactly as it was).
   function menuItemLabel(it) {
     try {
       const l = it.querySelector('.ytp-menuitem-label') || it.querySelector('.ytp-menuitem-title') || it;
       return (l.textContent || '').trim();
     } catch (e) { return ''; }
   }
-  async function menuSetQuality(wantH) {
+  async function menuSetQuality(sel) {
     const gear = document.querySelector('.ytp-settings-button');
     if (!gear) { dbg('menuSetQuality: no gear button'); return false; }
     const isOpen = () => {
@@ -255,21 +256,30 @@
       qItem.click();
       let qItems = [];
       for (let i = 0; i < 25; i++) {
-        qItems = items().filter(it => /^\d{3,4}p/i.test(menuItemLabel(it)));
+        qItems = items().filter(it => /^\d{3,4}p/i.test(menuItemLabel(it)) || /автоматически|auto/i.test(menuItemLabel(it)));
         if (qItems.length) break;
         await sleep(150);
       }
       if (!qItems.length) { closeIfOpen(); dbg('menuSetQuality: no visible quality items'); return false; }
+      if (sel === 'auto') {
+        const autoItem = qItems.find(it => /автоматически|auto/i.test(menuItemLabel(it)));
+        if (!autoItem) { closeIfOpen(); dbg('menuSetQuality: no auto entry'); return false; }
+        autoItem.click();
+        await sleep(250);
+        closeIfOpen();
+        dbg('menuSetQuality: selected auto');
+        return true;
+      }
       // Prefer the exact "1440p" entry over "1440p60"; accept any variant that starts
       // with the target height (labels normalize to digits: "1440p60" → "144060").
       const norm = (t) => String(t).replace(/[^0-9]/g, '');
-      const target = qItems.filter(it => norm(menuItemLabel(it)) === String(wantH))[0]
-                  || qItems.filter(it => norm(menuItemLabel(it)).startsWith(String(wantH)))[0];
-      if (!target) { closeIfOpen(); dbg('menuSetQuality: no entry for', wantH, qItems.map(menuItemLabel)); return false; }
+      const target = qItems.filter(it => norm(menuItemLabel(it)) === String(sel))[0]
+                  || qItems.filter(it => norm(menuItemLabel(it)).startsWith(String(sel)))[0];
+      if (!target) { closeIfOpen(); dbg('menuSetQuality: no entry for', sel, qItems.map(menuItemLabel)); return false; }
       target.click();
       await sleep(250);
       closeIfOpen(); // the menu may auto-close on selection; close it if it didn't
-      dbg('menuSetQuality: selected', wantH);
+      dbg('menuSetQuality: selected', sel);
       return true;
     } catch (e) { closeIfOpen(); dbg('menuSetQuality exception:', e); return false; }
   }
@@ -309,6 +319,17 @@
       throw new Error('не удалось переключить плеер на ' + wantRes + 'p (плеер отдаёт ' +
         (servedHeight() || '?') + 'p) — установите ' + wantRes + 'p вручную в плеере и повторите');
     }
+  }
+  // Restore the user's pre-download quality after the capture (the capture left the
+  // player at the requested resolution). Best-effort through the native menu — the only
+  // reliable switch; 'auto' re-selects "Автоматически". Never throws.
+  async function restoreQuality(prevKey) {
+    if (!prevKey || prevKey === '?' || prevKey === 'null') return;
+    try {
+      if (/^auto/i.test(prevKey)) { await menuSetQuality('auto'); return; }
+      const h = RES_NAME[prevKey];
+      if (h) await menuSetQuality(h);
+    } catch (e) { dbg('restoreQuality:', e); }
   }
   // Seek via the player API, which also updates YouTube's app-level streaming
   // position — plain v.currentTime only moves the element, so the player would
@@ -358,6 +379,9 @@
     const wantRes = RES_NAME[targetQ] || 0;  // requested height — the band centre / menu label
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
+    // Remember the user's current quality so it can be restored when the capture ends
+    // (the capture switches the player to the requested resolution).
+    const prevKey = (() => { try { return player().getPlaybackQuality(); } catch (e) { return null; } })();
     keepAutoplayOff();
     try { v.muted = true; } catch (e) {}
     try { v.pause(); } catch (e) {}
@@ -402,6 +426,7 @@
       try { v.playbackRate = prev.rate; } catch (err) {}
       seekVia(prev.time);
       try { v.muted = prev.muted; } catch (err) {}
+      await restoreQuality(prevKey); // the flush already changed the quality
       if (!prev.paused) { try { v.play(); } catch (err) {} }
       throw e;
     }
@@ -531,6 +556,8 @@
       seekVia(prev.time);
       try { v.muted = prev.muted; } catch (e) {}
       keepAutoplayOff(); // leave autoplay disabled — don't turn it back on
+      // restore the user's pre-download quality (the capture left it at the target)
+      await restoreQuality(prevKey);
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     // A mid-capture re-init (quality switch / buffer flush) REPLACED a track, so part of

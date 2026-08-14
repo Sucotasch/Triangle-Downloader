@@ -135,9 +135,16 @@
                   t.seams = (t.seams || 0) + 1;
                   dbg('capture re-init', kind, 'same-stream — glued (seam)', t.seams, 'bytes', totalCaptured());
                 } else {
-                  store.restarts[kind] = (store.restarts[kind] || 0) + 1;
+                  // A DIFFERENT-stream re-init (real quality switch). At the very START
+                  // of the capture it is usually the tail of OUR OWN target-quality
+                  // switch still settling — the replacement track re-covers the whole
+                  // range, so it must NOT be counted as a cut (it produced a false
+                  // "файл может быть обрезан" message on complete files). Only a
+                  // re-init well into the capture actually shortens the file.
+                  const nearStart = Math.abs((store.cursor || 0) - (store.capStart || 0)) < 2;
+                  if (!nearStart) store.restarts[kind] = (store.restarts[kind] || 0) + 1;
                   store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()], initBytes: u8.slice() };
-                  dbg('capture re-init', kind, 'DIFFERENT stream — track cut (restart)', store.restarts[kind]);
+                  dbg('capture re-init', kind, nearStart ? 'start-of-capture — replaced, not counted' : ('DIFFERENT stream — track cut (restart) ' + (store.restarts[kind] || 1)));
                 }
               } else {
                 store.tracks[kind] = { mime: this.__ytdlMime || '', parts: [u8.slice()], initBytes: u8.slice() };
@@ -437,6 +444,11 @@
     // them would blind trackEdge() and the per-track capture loop would fall back to the
     // union edge (the very freeze bug we're fixing).
     store.restarts = Object.create(null);
+    // Capture context for the appendBuffer patch: a re-init arriving within ~2 s of the
+    // start is our own quality switch settling (harmless), later ones are real cuts.
+    store.capStart = capStart;
+    store.capEnd = capEnd;
+    store.cursor = capStart;
     store.capturing = true;
     seekVia(capStart);
     await sleep(500);
@@ -516,6 +528,7 @@
 
         if (edge > cursor + 0.3) {                       // window extended → hop to the edge
           cursor = edge;
+          store.cursor = cursor; // keep the patch aware of the playhead for restart classification
           seekVia(Math.min(cursor, capEnd - 0.1));
           stall = 0;
         } else {                                         // plateaued → nudge to re-trigger fetch

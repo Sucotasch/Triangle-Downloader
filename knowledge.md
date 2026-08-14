@@ -141,12 +141,17 @@ All code lives in `extension/`. The extension is split into three contexts commu
   SAME quality (the quality is never re-applied during capture). The new init is compared
   byte-for-byte with the track's own init: identical ⇒ the stream before/after is the same
   codec and contiguous, so the redundant init is DROPPED and the media keeps appending
-  (`t.seams`, glued — the file stays whole, NO warning); different ⇒ a real quality switch,
-  the track is replaced and counted (`store.restarts`) ⇒ `complete:false`, UI warns
-  "во время захвата переключилось качество". The eviction guard only applies when there
-  were NO seams (a re-fetch without a re-init can duplicate bytes; a glued capture is whole
-  by construction). Diagnostics: `[YTDL] capture re-init <kind> same-stream/DIFFERENT`, and
-  the final `[YTDL] capture {…, seams} restarts: N` line distinguishes the two.
+  (`t.seams`, glued — the file stays whole, NO warning); different ⇒ the track is replaced
+  and — unless the re-init landed within ~2 s of the capture start — counted as a cut
+  (`store.restarts`) ⇒ `complete:false`, UI warns "во время захвата переключилось
+  качество". **A re-init at the very start is the tail of OUR OWN target-quality switch
+  still settling**: the replacement track re-covers the whole range and the file is
+  complete, so it is NOT counted (previously it produced a false "файл может быть обрезан"
+  message on complete files — confirmed live with a full 1440p file). The restore-to-
+  pre-download quality happens with `store.capturing = false` and can never be counted.
+  The eviction guard only applies when there were NO seams. Diagnostics: `[YTDL] capture
+  re-init <kind> same-stream/start-of-capture/DIFFERENT`, and the final `[YTDL] capture
+  {…, seams} restarts: N` line distinguishes the two.
 - **Conflicting extensions can force-reset the quality (known external cause, confirmed
   live)**: "YouTube Auto HD + FPS" and similar quality-forcing extensions keep calling the
   player's quality API, switching it back to AUTO/range mode and OVERRIDING our native-menu

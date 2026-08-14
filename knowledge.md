@@ -97,31 +97,28 @@ All code lives in `extension/`. The extension is split into three contexts commu
   1080p and ffmpeg.wasm is single-threaded WASM (~5–10× slower than native), so a 20 s exact
   cut at 2160p takes minutes even with the `ultrafast` preset (auto-picked via
   `quickEncode = exactCut && !transcode`). This is expected, not a regression — verified live.
-- **NEVER call `setPlaybackQualityRange` — at all, before OR after the menu** — this is
-  the #1 quality gotcha, confirmed live twice: the range call switches the player to AUTO
-  (range) mode, where ABR serves the viewport-capped resolution (720p in a small window)
-  and keeps re-adjusting quality during the capture. Every re-adjustment re-inits the
-  SourceBuffer and CUTS the recorded track (→ `complete:false`, "может быть обрезан", and
-  files that freeze mid-clip — the video track restarts at a later timestamp while the
-  audio keeps the full length). The full instability the user reported (constant
-  "разрешение изменилось", 2-of-3 files saved at 720p, frozen video / continuing audio)
-  was traced to TWO such calls in the old flow: the pre-capture downgrade to a low quality
-  (`setQualityRaw(preQ)`) and the post-menu fallback that fired when `getPlaybackQuality()`
-  reported 'auto' or a stale value within 300 ms (the player often hadn't updated yet, so
-  the fallback re-enabled range mode on nearly every run).
-- **Quality is forced ONCE, before recording, and never touched again** (`forceQuality` in
-  `content_hook.js`): high-res (1440p/2160p) via the **native settings menu**
+- **The JS quality API (BOTH `setPlaybackQualityRange` AND `setPlaybackQuality`) is
+  IGNORED by the SABR player for switching quality** — the native settings menu is the
+  ONLY reliable switch. Confirmed live: after removing the range calls, a download
+  succeeded only when the user had set the matching resolution by hand, and requesting a
+  DIFFERENT resolution aborted with "не удалось переключить плеер" (the API call did
+  nothing). Bonus finding: the range variant additionally puts the player in AUTO mode
+  (ABR re-adjusts mid-capture, re-initing SourceBuffers and cutting the track) — so it is
+  harmful AND useless. Never call either variant.
+- **Every quality change happens via the native settings menu, ONCE, before recording**
   (`menuSetQuality` — opens the gear, picks the exact "Np" entry, closes it on every exit
-  path; the same path the user clicks manually; retried once, fixed-quality API only as a
-  last resort when the gear menu is unreachable); 720p/1080p via `setPlaybackQuality`
-  (FIXED request, no range); mp3 drops the video to 360p (only audio is used).
-  `setPlaybackQuality` is a fixed request — it does NOT enter range mode and is safe to
-  re-apply. The serve is verified with the decoded `videoHeight` inside the band
-  `[RES_H, RES_NAME + 150]` — both directions, so an upgrade must RISE and a downgrade must
-  FALL (the old `>= wantH` check passed instantly on a stale height and let a pending
-  switch re-init DURING capture). If the band isn't reached (~12 s high-res / ~5 s low-res),
-  the download ABORTS with a clear error ("не удалось переключить плеер на Np…") instead
-  of producing a mislabelled file. mp3 never aborts on video height.
+  path; the same path the user clicks manually; retried once). The pre-capture sequence in
+  `playthrough()`: (1) FLUSH — switch to the LOWEST available quality (forces the player
+  to re-fetch at a different itag, evicting any stale buffer that could cover the capture
+  start; best-effort), (2) seek to a position clearly different from capStart (a real jump
+  re-inits AUDIO too — same itag at every quality), (3) `forceQuality(wantRes, wantH,
+  needVideo)` — switch to the target via the menu and verify the decoded `videoHeight`
+  settles inside the band `[RES_H, RES_NAME + 150]` (BOTH directions: an upgrade must RISE
+  and a downgrade must FALL — the old `>= wantH` check passed instantly on a stale height
+  and let a pending switch re-init DURING capture). If the band isn't reached (~12 s video
+  / ~5 s mp3), the download ABORTS with a clear error ("не удалось переключить плеер на
+  Np… — установите Np вручную…") instead of producing a mislabelled file. mp3 never
+  aborts on video height.
   NO player layout is touched (no theater mode — `setTheaterModeRequested` toggles instead
   of setting, and it broke the user's wide layout). The download reply still carries the
   actually-served `height`; `content_ui.js` names the file after the real resolution and

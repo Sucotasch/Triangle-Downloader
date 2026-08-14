@@ -192,25 +192,13 @@
   const Q = { 2160: 'hd2160', 1440: 'hd1440', 1080: 'hd1080', 720: 'hd720' };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // Fixed-quality request ONLY — the range variant (setPlaybackQualityRange) is NEVER
-  // called: it puts the player in AUTO (range) mode, where ABR serves the viewport-capped
-  // resolution and keeps re-adjusting quality during the capture. Every re-adjustment
-  // re-inits the SourceBuffer and CUTS the recorded track (→ complete:false — files that
-  // downgrade or freeze mid-clip). setPlaybackQuality is a fixed request, safe to re-apply.
-  function setQualityFixed(q) {
-    const p = player();
-    // Public API first...
-    try { p.setPlaybackQuality && p.setPlaybackQuality(q); } catch (e) {}
-    // ...then whatever internal variants the player exposes (best-effort; modern builds
-    // sometimes only honour those). All wrapped — a bad probe must never break playback.
-    try {
-      const ia = p.getInternalApiInterface && p.getInternalApiInterface();
-      if (ia && ia.setPlaybackQuality) ia.setPlaybackQuality(q);
-    } catch (e) {}
-    try {
-      const ip = p.getInternalPlayer && p.getInternalPlayer();
-      if (ip && ip.setPlaybackQuality) ip.setPlaybackQuality(q);
-    } catch (e) {}
+  // The LOWEST quality available in the player — the pre-capture flush target. (The JS
+  // quality API — both setPlaybackQualityRange and setPlaybackQuality — is IGNORED by
+  // the SABR player for switching quality, which is why downloads used to require setting
+  // the resolution by hand; the native settings menu is the ONLY reliable switch.)
+  function lowestAvailableHeight() {
+    const hs = availableHeights();
+    return hs.length ? Math.min.apply(null, hs) : 0;
   }
   function availableHeights() {
     try {
@@ -230,12 +218,12 @@
   const RES_NAME = { hd2160: 2160, hd1440: 1440, hd1080: 1080, hd720: 720, medium: 360, small: 240, tiny: 144 };
   function servedHeight() { try { return video().videoHeight || 0; } catch (e) { return 0; } }
 
-  // Force the quality the way the user does it: through the native settings menu. The JS
-  // quality API (setPlaybackQualityRange) is unreliable in the SABR player and can keep
-  // silently serving 720p, but the menu path always works. Best-effort: returns true when
-  // the target was selected, false when the menu wasn't reachable. NO state toggles here —
-  // we only ever open the menu, pick a quality, and close it (the user's layout is left
-  // exactly as it was).
+  // Force the quality the way the user does it: through the native settings menu — the
+  // ONLY reliable quality switcher in the SABR player (the JS API, fixed or range, is
+  // ignored for switching: users had to set the resolution by hand for downloads to
+  // work). Best-effort: returns true when the target was selected, false when the menu
+  // wasn't reachable. NO state toggles here — we only ever open the menu, pick a quality,
+  // and close it (the user's layout is left exactly as it was).
   function menuItemLabel(it) {
     try {
       const l = it.querySelector('.ytp-menuitem-label') || it.querySelector('.ytp-menuitem-title') || it;
@@ -285,50 +273,41 @@
       return true;
     } catch (e) { closeIfOpen(); dbg('menuSetQuality exception:', e); return false; }
   }
-  // Select `targetQ` and confirm the player actually serves it — ALL before recording
-  // starts, because any quality switch during capture re-inits the SourceBuffer and CUTS
-  // the recorded track. "Settled" means the decoded frame height is inside the band
-  // [wantH, wantRes + 150]: waiting on BOTH sides — the height must RISE for an upgrade
-  // AND FALL for a downgrade — so the switch has fully completed before recording.
-  //   * highRes (1440p/2160p): native settings menu (retried once; the fixed-quality API
-  //     only as a last resort when the gear menu is unreachable), verified up to ~12 s;
-  //     throws a clear error when the resolution can't be confirmed.
-  //   * 720p/1080p: fixed-quality API, short verification with re-applies; throws when it
-  //     isn't confirmed (an honest failure beats a mislabelled file).
-  //   * mp3: only the audio track is used — the video is dropped to 360p to save
-  //     bandwidth and its resolution is never enforced.
-  async function forceQuality(targetQ, wantRes, wantH, highRes, needVideo) {
+  // Select the requested quality via the NATIVE settings menu — the only reliable quality
+  // switcher in the SABR player (the JS API, fixed or range, is ignored for switching:
+  // that is why downloads used to require setting the resolution by hand) — and confirm
+  // the player actually serves it, ALL before recording starts (any switch during capture
+  // re-inits the SourceBuffer and cuts the track; same-stream re-inits are glued as seams).
+  // "Settled" means the decoded frame height is inside the band [wantH, wantRes + 150]:
+  // waiting on BOTH sides — the height must RISE for an upgrade AND FALL for a downgrade —
+  // so the switch has fully completed before recording. Video targets that can't be
+  // confirmed within ~12 s abort with a clear error (an honest failure beats a mislabelled
+  // file); mp3 is best-effort (only audio is used — the video is just capped to save RAM).
+  async function forceQuality(wantRes, wantH, needVideo) {
     const qBefore = (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })();
     const settled = () => {
       const h = servedHeight();
       return h >= wantH && h <= wantRes + 150;
     };
-    if (highRes) {
+    if (!await menuSetQuality(wantRes)) {
+      await sleep(400);
       if (!await menuSetQuality(wantRes)) {
-        await sleep(400);
-        if (!await menuSetQuality(wantRes)) setQualityFixed(targetQ); // menu unreachable — fixed API last resort
+        dbg('quality: menu unreachable — cannot switch');
+        if (needVideo && !settled()) {
+          throw new Error('не удалось переключить плеер на ' + wantRes + 'p — меню качества недоступно, установите ' + wantRes + 'p вручную и повторите');
+        }
+        return;
       }
-      for (let i = 0; i < 60 && !settled(); i++) {
-        if (i === 30) await menuSetQuality(wantRes); // re-select mid-way, still pre-recording
-        await sleep(200);
-      }
-      dbg('quality', { highRes, before: qBefore, after: (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })(), served: servedHeight() });
-      if (!settled()) {
-        throw new Error('не удалось переключить плеер на ' + wantRes + 'p (плеер отдаёт ' +
-          (servedHeight() || '?') + 'p) — увеличьте окно плеера и повторите');
-      }
-      return;
     }
-    // 720p / 1080p / mp3
-    setQualityFixed(targetQ);
-    for (let i = 0; i < 25 && !settled(); i++) {
-      if (i % 2 === 0) setQualityFixed(targetQ);
+    const iter = needVideo ? 60 : 25;
+    for (let i = 0; i < iter && !settled(); i++) {
+      if (i === Math.floor(iter / 2)) await menuSetQuality(wantRes); // re-select mid-way, still pre-recording
       await sleep(200);
     }
-    dbg('quality', { highRes, before: qBefore, after: (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })(), served: servedHeight() });
+    dbg('quality', { before: qBefore, after: (() => { try { return player().getPlaybackQuality(); } catch (e) { return '?'; } })(), served: servedHeight() });
     if (needVideo && !settled()) {
       throw new Error('не удалось переключить плеер на ' + wantRes + 'p (плеер отдаёт ' +
-        (servedHeight() || '?') + 'p) — повторите попытку');
+        (servedHeight() || '?') + 'p) — установите ' + wantRes + 'p вручную в плеере и повторите');
     }
   }
   // Seek via the player API, which also updates YouTube's app-level streaming
@@ -373,47 +352,49 @@
     const capEnd = Math.min(opts.end && opts.end > 0 ? opts.end : dur, dur);
     const capStart = Math.max(0, Math.min(opts.start || 0, Math.max(0, capEnd - 1)));
     const capId = vidId();
-    // Verification thresholds: high-res needs the native menu (ABR silently serves less),
-    // low-res/mp3 use the fixed-quality API — both are confirmed before recording starts.
+    // Verification band for the served height: [wantH, wantRes + 150]. ALL qualities go
+    // through the native menu (the JS API cannot switch quality in the SABR player).
     const wantH = RES_H[targetQ] || 0;       // lower bound of the served-height band
     const wantRes = RES_NAME[targetQ] || 0;  // requested height — the band centre / menu label
-    const highRes = wantRes >= 1440;         // only 1440p/2160p need the menu dance
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
     keepAutoplayOff();
     try { v.muted = true; } catch (e) {}
     try { v.pause(); } catch (e) {}
 
-    // Order matters — and only FIXED quality requests happen here (never the range
-    // variant — see setQualityFixed):
-    //  1) downgrade to a clearly LOWER quality via the fixed API, so the player re-fetches
-    //     fresh segments at a DIFFERENT itag. That rebuilds the buffer at preSeek from
-    //     scratch — without this, a video already playing at the requested quality would
-    //     keep its stale buffer, the later seek to capStart would not be a real jump, and
-    //     the capture would never see a fresh init ("не удалось захватить аудио").
+    // Order matters — every quality change happens through the native settings menu, the
+    // only reliable switcher in the SABR player (the JS API, fixed or range, is ignored):
+    //  1) FLUSH: switch to the LOWEST available quality. That forces the player to
+    //     re-fetch fresh segments at a DIFFERENT itag, evicting any stale buffer that
+    //     could cover capStart — without it, a video already playing at the requested
+    //     quality would keep its buffer, the later seek to capStart would not be a real
+    //     jump, and the capture would never see a fresh init ("не удалось захватить
+    //     аудио"). Best-effort: if the menu can't be driven we continue anyway.
     //  2) seek to a position clearly DIFFERENT from capStart (a real jump also re-inits
-    //     audio, whose itag is the same Opus at every quality), then force the target
-    //     quality and VERIFY the player actually serves it — all while recording is still
-    //     OFF — and only then start recording and seek to capStart. Capture begins at the
-    //     requested fragment, not the video's start.
-    const preQ = (targetQ === 'small' || targetQ === 'tiny' || targetQ === 'medium') ? 'tiny' : 'medium';
-    const preSeek = capStart > 10 ? 0 : Math.min(35, Math.max(1, dur - 5));
+    //     AUDIO, whose itag is the same Opus at every quality — only a position change
+    //     re-fetches it), then select the target quality and VERIFY the player actually
+    //     serves it — all while recording is still OFF — and only then start recording
+    //     and seek to capStart. Capture begins at the requested fragment, not the video's
+    //     start.
+    const preSeek = capStart > 10 ? (dur - 5 > 10 ? dur - 5 : 0) : Math.min(35, Math.max(1, dur - 5));
     try {
-      setQualityFixed(preQ);
-      await sleep(500);
+      const lowH = lowestAvailableHeight();
+      if (lowH) {
+        try { await menuSetQuality(lowH); } catch (e) {}
+        await sleep(500); // let the flush switch start (recording is still OFF)
+      }
       seekVia(preSeek);
       await sleep(700);
 
-      // Force the requested quality BEFORE recording anything and verify the player
-      // actually serves it. High-res (1440p/2160p) is selected via the native settings menu
-      // (the same path the user clicks manually — the JS API can silently keep serving 720p
-      // in the SABR player); 720p/1080p/mp3 use the fixed-quality API. From here on the
-      // quality is NEVER touched again — any switch mid-recording re-inits the SourceBuffer
-      // and CUTS the recorded track (which is why such restarts are tracked and reported as
-      // partial). forceQuality throws a clear error when the requested quality can't be
-      // confirmed — a capture that starts at the wrong resolution would produce a
-      // mislabelled file, which is worse than an honest failure.
-      await forceQuality(targetQ, wantRes, wantH, highRes, needVideo);
+      // Select the requested quality BEFORE recording anything and verify the player
+      // actually serves it — via the native settings menu (the same path the user clicks
+      // manually). From here on the quality is NEVER touched again — any switch
+      // mid-recording re-inits the SourceBuffer and CUTS the recorded track (same-stream
+      // re-inits are glued as seams; different-stream ones are counted as restarts and
+      // reported as partial). forceQuality throws a clear error when the requested
+      // quality can't be confirmed — a capture that starts at the wrong resolution would
+      // produce a mislabelled file, which is worse than an honest failure.
+      await forceQuality(wantRes, wantH, needVideo);
     } catch (e) {
       // Restore the player state on a PRE-recording failure (the capture loop below has
       // its own finally): an unconfirmed quality must not leave the player muted or stuck

@@ -97,26 +97,35 @@ All code lives in `extension/`. The extension is split into three contexts commu
   1080p and ffmpeg.wasm is single-threaded WASM (~5–10× slower than native), so a 20 s exact
   cut at 2160p takes minutes even with the `ultrafast` preset (auto-picked via
   `quickEncode = exactCut && !transcode`). This is expected, not a regression — verified live.
-- **Resolution verification**: the modern ABR player can silently serve a lower resolution
-  even when `setPlaybackQualityRange('hd2160','hd2160')` is called. For high-res targets
-  (`RES_H[target] > 700`, i.e. 1440p/2160p) `playthrough()` selects the quality through the
-  **native settings menu** (`menuSetQuality` — opens the gear, picks the exact "Np" entry,
-  closes it on every exit path; the same path the user clicks manually, which the user
-  confirmed works), then polls `video.videoHeight` against `RES_H` thresholds (up to ~16 s)
-  — ALL **before** recording starts, because re-applying quality DURING capture would
-  re-init the SourceBuffer and cut the track.
-- **NEVER call the JS quality API after a successful menu selection** — this is the #1
-  high-res gotcha, confirmed live: `setPlaybackQualityRange` switches the player to AUTO
-  (range) mode, which overrides the manual menu choice (ABR serves viewport-capped 720p)
-  and keeps re-adjusting quality during capture (each switch re-inits the SourceBuffer and
-  CUTS the recorded track → `complete:false`). So `setQualityRaw(targetQ)` is called ONLY
-  when `menuSetQuality` returned false, and the verify loop never re-applies the API when
-  the menu succeeded. Diagnostics: `[YTDL] quality {menuOk, before, after}` logs
-  `getPlaybackQuality()` before/after.
+- **NEVER call `setPlaybackQualityRange` — at all, before OR after the menu** — this is
+  the #1 quality gotcha, confirmed live twice: the range call switches the player to AUTO
+  (range) mode, where ABR serves the viewport-capped resolution (720p in a small window)
+  and keeps re-adjusting quality during the capture. Every re-adjustment re-inits the
+  SourceBuffer and CUTS the recorded track (→ `complete:false`, "может быть обрезан", and
+  files that freeze mid-clip — the video track restarts at a later timestamp while the
+  audio keeps the full length). The full instability the user reported (constant
+  "разрешение изменилось", 2-of-3 files saved at 720p, frozen video / continuing audio)
+  was traced to TWO such calls in the old flow: the pre-capture downgrade to a low quality
+  (`setQualityRaw(preQ)`) and the post-menu fallback that fired when `getPlaybackQuality()`
+  reported 'auto' or a stale value within 300 ms (the player often hadn't updated yet, so
+  the fallback re-enabled range mode on nearly every run).
+- **Quality is forced ONCE, before recording, and never touched again** (`forceQuality` in
+  `content_hook.js`): high-res (1440p/2160p) via the **native settings menu**
+  (`menuSetQuality` — opens the gear, picks the exact "Np" entry, closes it on every exit
+  path; the same path the user clicks manually; retried once, fixed-quality API only as a
+  last resort when the gear menu is unreachable); 720p/1080p via `setPlaybackQuality`
+  (FIXED request, no range); mp3 drops the video to 360p (only audio is used).
+  `setPlaybackQuality` is a fixed request — it does NOT enter range mode and is safe to
+  re-apply. The serve is verified with the decoded `videoHeight` inside the band
+  `[RES_H, RES_NAME + 150]` — both directions, so an upgrade must RISE and a downgrade must
+  FALL (the old `>= wantH` check passed instantly on a stale height and let a pending
+  switch re-init DURING capture). If the band isn't reached (~12 s high-res / ~5 s low-res),
+  the download ABORTS with a clear error ("не удалось переключить плеер на Np…") instead
+  of producing a mislabelled file. mp3 never aborts on video height.
   NO player layout is touched (no theater mode — `setTheaterModeRequested` toggles instead
-  of setting, and it broke the user's wide layout). The download reply carries the
+  of setting, and it broke the user's wide layout). The download reply still carries the
   actually-served `height`; `content_ui.js` names the file after the real resolution and
-  toasts "плеер отдал Np вместо Mp" when downgraded.
+  toasts "плеер отдал Np вместо Mp" as a safety net for external interference.
 - **Capture loop must use PER-TRACK buffered edges, never the union**: `video.buffered` is the
   union across SourceBuffers, and at high bitrates the audio buffer extends far beyond the
   video one — the union edge would "complete" a capture whose VIDEO track is only a few

@@ -168,6 +168,15 @@ All code lives in `extension/`. The extension is split into three contexts commu
   the refactor/cleanup commits were proven behavior-identical (byte-level) while a single
   re-downloaded video got slow. Confirmed fully recoverable: after a pause, the same video
   downloaded at normal speed again — wait it out rather than debugging the code.
+- **Chrome rejects some titles with "Invalid filename"**: `chrome.downloads` refuses
+  filenames containing control (Cc) or format (Cf) characters (`net::IsSafePortableRelativePath`
+  → `base::i18n::IsFilenameLegal`). Some YouTube titles embed invisible characters around the
+  text — e.g. U+2060 WORD JOINER — specifically so the title can't be copied (confirmed live:
+  "Masha x Maria Spichers - Otra noche (Video Oficial)"). The whole capture+ffmpeg succeeds,
+  then the save fails with "Invalid filename". `safeName()` in `lib/format.js` strips
+  `\u0000-\u001f \u007f-\u009f \u00ad \u200b-\u200f \u2028-\u202e \u2060-\u206f \ufeff`
+  (invisible format/control chars), plus trailing dots/spaces (also rejected at ends), and
+  falls back to `'video'` if the result would be empty. Tests in `tests/format.test.js`.
 - **User must run an ad blocker (uBlock Origin)** — without it YouTube injects ad breaks into
   the media stream and capture fails. This is stated in the README as a hard requirement.
 - **Never retry `ytdl-finalize`** — a repeated finalize re-runs ffmpeg on already-freed data.

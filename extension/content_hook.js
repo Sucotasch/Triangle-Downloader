@@ -192,12 +192,25 @@
     return n;
   }
 
+  // NOTE — a rejected idea, kept so it is not retried: evicting the capture range with
+  // sb.remove(capStart, capEnd) before recording does hide the pre-capture "stale window",
+  // but the player must then resume from a buffer we emptied, and it dies with
+  // `ump.spsrejectfailure` (measured live 2026-10-13: duration → null, currentTime → 0,
+  // player state -1) as soon as playback resumes during unsticking. The coverage loop below
+  // handles the same window without touching the player's buffers.
+
   // ---- player helpers ------------------------------------------------------
   function player() { return document.getElementById('movie_player'); }
   function video() { return document.querySelector('video'); }
   // quality name per capture height — YouTube's setPlaybackQuality keys
   const Q = { 2160: 'hd2160', 1440: 'hd1440', 1080: 'hd1080', 720: 'hd720' };
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  // m:ss — the honest "captured up to X of Y" error message needs it.
+  const clock = (sec) => {
+    sec = Math.max(0, Math.round(sec || 0));
+    const m = Math.floor(sec / 60), s = sec % 60;
+    return m + ':' + String(s).padStart(2, '0');
+  };
 
   // The LOWEST quality available in the player — the pre-capture flush target. (The JS
   // quality API — both setPlaybackQualityRange and setPlaybackQuality — is IGNORED by
@@ -479,12 +492,6 @@
     // like ordinary buffering to YouTube. Segments arrive strictly in order (verified:
     // monotonic cluster timecodes, no duplicates) because we only ever seek forward
     // to the contiguous edge.
-    const bufferedEndAt = (t) => {
-      for (let i = 0; i < v.buffered.length; i++) {
-        if (v.buffered.start(i) <= t + 0.5 && v.buffered.end(i) >= t) return v.buffered.end(i);
-      }
-      return t;
-    };
     // Where the captured data actually begins: the player can only start at a segment
     // boundary at or before capStart, so the file may lead in by a few seconds. The
     // caller needs this to trim RELATIVE to the file (ffmpeg's -ss counts from the
@@ -495,29 +502,32 @@
       }
       return t;
     };
-    // Per-track buffered edge. v.buffered is the UNION across SourceBuffers: at high
-    // bitrates the audio buffer can extend far beyond the video one, so the union edge
-    // would "complete" the capture while the VIDEO track is still a few seconds long —
-    // producing a file that freezes on the last decoded frame (video ends, audio runs on).
-    // Driving hops and completion off the real per-track edges keeps them advancing
-    // together. Falls back to the union edge only when a SourceBuffer reference is stale.
-    const trackEdge = (kind, t) => {
+    // Per-track coverage. v.buffered is the UNION across SourceBuffers: at high bitrates the
+    // audio buffer extends far beyond the video one, so a union edge would "complete" a
+    // capture whose VIDEO track is still seconds long (a file that freezes on its last decoded
+    // frame) — and, worse, it would let the loop hop over a stretch the PLAYER had already
+    // buffered but we never recorded, leaving a silent hole mid-file. So coverage is read from
+    // each track's OWN SourceBuffer, and "no range covers this point" is reported as null —
+    // never as a fallback edge that would let the capture walk past a gap.
+    const coveredTo = (kind, t) => {
       try {
         const sb = store.sb[kind];
-        if (!sb) return 0;
+        if (!sb) return null;
         const b = sb.buffered;
         for (let i = 0; i < b.length; i++) {
-          if (b.start(i) <= t + 0.5 && b.end(i) >= t) return b.end(i);
+          if (b.start(i) <= t + 0.6 && b.end(i) >= t) return b.end(i);
         }
-        return 0;
-      } catch (e) { return 0; }
+        return null;
+      } catch (e) { return null; }
     };
     let capturedFrom = capStart;
-    let cursor = capStart, stall = 0;
+    // Everything between capStart and `frontier` is captured on EVERY track we need.
+    let frontier = capStart, stall = 0, unsticking = false;
     let complete = false;
     let actualH = 0;
     let seamCount = 0;           // same-stream re-inits glued into the track (not cuts)
     const span = Math.max(0.1, capEnd - capStart);
+    const mediaEnd = isFinite(dur) && dur > 0 ? dur : capEnd;
     const started = Date.now();
     try {
       try { v.pause(); } catch (e) {}
@@ -525,32 +535,40 @@
       while (true) {
         await sleep(350);
         if (vidId() !== capId) throw new Error('видео переключилось во время захвата');
-        try { if (!v.paused) v.pause(); } catch (e) {} // keep it paused; buffering runs anyway
-
-        const unionEdge = bufferedEndAt(cursor);
-        const vRaw = needVideo ? trackEdge('video', cursor) : capEnd;
-        const aRaw = trackEdge('audio', cursor);
-        const vE = vRaw || unionEdge;
-        const aE = aRaw || unionEdge;
-        const edge = Math.min(vE, aE, capEnd);
-        onProgress(Math.min(0.99, Math.max(0, edge - capStart) / span));
-        // Complete ONLY when the RAW per-track edges reached the end. A fallback union
-        // edge must never count — audio's far-ahead buffer would declare a short video
-        // track done and we'd ship the frozen-frame file again.
-        if (vRaw >= capEnd - 0.6 && aRaw >= capEnd - 0.6) { complete = true; break; }
+        const vRaw = needVideo ? coveredTo('video', frontier) : capEnd;
+        const aRaw = coveredTo('audio', frontier);
+        // The point both needed tracks cover: a missing range on either is null (no progress).
+        const both = needVideo ? (vRaw != null && aRaw != null ? Math.min(vRaw, aRaw) : null) : aRaw;
+        onProgress(Math.min(0.99, Math.max(0, frontier - capStart) / span));
+        // Complete ONLY when BOTH tracks cover the end of the requested range. `frontier` is
+        // advanced here too: the request's end can arrive in one jump from a stale frontier
+        // (the last window covers past capEnd), and the post-capture check reads `frontier`.
+        if (both != null && both >= capEnd - 0.5) { complete = true; frontier = Math.min(both, capEnd); break; }
         if (totalCaptured() > BYTE_CAP) break;          // memory safety valve → incomplete
 
-        if (edge > cursor + 0.3) {                       // window extended → hop to the edge
-          cursor = edge;
-          store.cursor = cursor; // keep the patch aware of the playhead for restart classification
-          seekVia(Math.min(cursor, capEnd - 0.1));
+        if (both != null && both > frontier + 0.25) {    // coverage extended → hop to the edge
+          frontier = both;
+          if (unsticking) { unsticking = false; try { v.pause(); } catch (e) {} }
+          store.cursor = frontier; // keep the patch aware of the playhead for restart classification
+          seekVia(Math.min(frontier, capEnd - 0.05));
           stall = 0;
-        } else {                                         // plateaued → nudge to re-trigger fetch
+        } else {
+          // Plateau. A paused player sometimes stops fetching altogether, and a forward seek
+          // does not revive it (measured live); letting it PLAY does — and playback only ever
+          // appends further forward, so it can also fill a stretch the player had buffered but
+          // we never recorded. Re-seek first (cheap), escalate to playing if that fails.
           stall++;
-          if (stall % 4 === 0) seekVia(Math.min(cursor + 0.1, capEnd - 0.1));
-          if (stall >= 60) break;                        // ~21s with no progress → give up
+          if (!unsticking && stall % 5 === 0) seekVia(Math.min(frontier, capEnd - 0.05));
+          if (!unsticking && stall >= 12) { unsticking = true; try { await v.play(); } catch (e) {} }
         }
-        if (Date.now() - started > 20 * 60 * 1000) break; // hard cap
+        // Never let the unsticking playback run past the fragment (or on into the next video).
+        if (v.currentTime >= capEnd - 0.4) { unsticking = false; try { v.pause(); } catch (e) {} }
+        if (!unsticking) { try { if (!v.paused) v.pause(); } catch (e) {} }
+
+        if (frontier >= mediaEnd - 1.5) break;             // reached the end of the media itself
+        if (stall >= 25 && frontier >= mediaEnd - 3) break; // a stream can end just before its duration
+        if (stall >= 200) break;                           // ~70s without a single new byte
+        if (Date.now() - started > 20 * 60 * 1000) break;  // hard cap
       }
       capturedFrom = Math.min(capturedFrom, bufferedStartAt(capStart));
       actualH = servedHeight(); // resolution the player actually served during capture
@@ -587,6 +605,15 @@
       await restoreQuality(prevKey);
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
+    // The user asked for a specific range: deliver it, or say so honestly. Handing back
+    // whatever happened to arrive is how a clip ends up with its picture stopping before its
+    // sound (or with a stretch missing) while still looking like a success. The player state
+    // is already restored above, so failing here costs only the error message.
+    if (!(frontier >= capEnd - 0.5 || frontier >= mediaEnd - 1.5)) {
+      throw new Error('не удалось загрузить фрагмент целиком — получено до ' + clock(frontier) +
+        ' из ' + clock(capEnd) + '. Попробуйте ещё раз');
+    }
+
     // A mid-capture re-init (quality switch / buffer flush) REPLACED a track, so part of
     // the range is missing from the file — report honestly as incomplete. Same-stream
     // re-inits (seams) were glued and do NOT cut the file.
@@ -594,10 +621,10 @@
     if (restartCount > 0) complete = false;
     // NOTE: restarts/bytes are logged as SEPARATE arguments because Chrome's console
     // collapses an object into "{...}" when copied, hiding the values.
-    dbg('capture', { targetQ, requestedH: wantRes, servedH: actualH, complete, seams: seamCount }, 'restarts:', restartCount, 'bytes:', totalCaptured());
+    dbg('capture', { targetQ, requestedH: wantRes, servedH: actualH, complete, capturedTo: frontier, seams: seamCount }, 'restarts:', restartCount, 'bytes:', totalCaptured());
 
     onProgress(1);
-    return { capturedFrom: Math.max(0, capturedFrom), complete, actualH: actualH || 0, restarts: restartCount, seams: seamCount };
+    return { capturedFrom: Math.max(0, capturedFrom), capturedTo: frontier, complete, actualH: actualH || 0, restarts: restartCount, seams: seamCount };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------

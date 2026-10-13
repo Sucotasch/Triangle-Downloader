@@ -12,22 +12,29 @@ own decrypted MSE stream locally — no `yt-dlp`, no external servers. UI string
 errors are in **Russian**; code comments are in English. Docs: `README.md` (ru) / `README.en.md`.
 
 ## Quickstart
-- **No build system**: plain vanilla JS, no npm, no `package.json` (it's gitignored), no tests, no linters.
+- **No build system**: plain vanilla JS, no npm, no `package.json` (gitignored), no linters,
+  no bundler. `node --check <file>.js` is the only static check used.
 - **Setup / Dev**: edit files, then load unpacked from `chrome://extensions` → Developer mode →
   **Load unpacked** → select the **`extension/`** folder. Reload the extension after edits
   (and refresh the YouTube tab for `content_hook.js` changes).
-- **Test**: `node --test tests/` — node:test suite (Node 18+, zero deps) for the pure
-  helpers in `extension/lib/format.js` (time/trim matrix/base64/run cascade). No linter or
-  build step.
+- **Test**: `node --test` (from the repo root) — node:test suite (Node 18+, zero deps) for the
+  pure helpers in `extension/lib/format.js` (time/trim matrix/base64/run cascade). No linter or
+  build step. **Pass a file or a glob, never a directory**: `node --test tests/` dies with
+  `MODULE_NOT_FOUND` on Node 22+ (verified on Node 24 / Windows) — use `node --test`,
+  `node --test tests/format.test.js`, or `node --test "tests/**/*.test.js"` (25 tests, all pass).
 - **Debug**: `DEBUG` flag at the top of `content_hook.js` (off by default) re-enables the
   `[YTDL]` diagnostics that were used to chase the quality/capture issues.
+- **Repo docs**: `README.md` (ru) / `README.en.md`; `Audit.md` is a 2026-08-11 senior code
+  review produced from `ReviewPrompt.txt` (proposals only — no code was changed); `Error.txt` /
+  `log.txt` are gitignored local console dumps.
 
 ## Architecture
 
 All code lives in `extension/`. The extension is split into three contexts communicating over
 `chrome.runtime` messages:
 
-- **`manifest.json`** — MV3; permissions `downloads`, `offscreen`, `storage`; host permission
+- **`manifest.json`** — MV3; permissions `downloads`, `offscreen`, `storage`,
+  `system.memory` (for `ytdl-mem`); `minimum_chrome_version: 116`, `version: 1.5.1`; host permission
   `*://www.youtube.com/*`; CSP allows `'wasm-unsafe-eval'` (needed by ffmpeg.wasm).
 - **`content_hook.js`** — runs in the **MAIN world** at `document_start`, before the player.
   Patches `MediaSource.isTypeSupported` / `canPlayType` / `mediaCapabilities.decodingInfo` to
@@ -44,8 +51,8 @@ All code lives in `extension/`. The extension is split into three contexts commu
   ffmpeg itself (no DOM/Worker in a SW).
 - **`offscreen.js`** — runs **ffmpeg.wasm** in `offscreen.html`. Receives tracks in base64
   chunks, assembles the final file: fast `-c copy` remux (VP9/Opus into mp4/webm), H.264/AAC
-  re-encode, or mp3 (libmp3lame). Tries a cascade of ffmpeg run variants, keeps the first
-  non-empty result.
+  re-encode, or mp3 (libmp3lame, 192 kbps default / 320 kbps from the menu). Tries a cascade
+  of ffmpeg run variants, keeps the first non-empty result.
 - **`lib/format.js`** — shared PURE helpers (time/trim/base64/filenames/ffmpeg run
   cascade), registered as `globalThis.YTDL_LIB`. Injected by the manifest before
   `content_ui.js` (ISOLATED world) and by `offscreen.html` before `offscreen.js`; also
@@ -192,3 +199,44 @@ All code lives in `extension/`. The extension is split into three contexts commu
 - Capture is seek-driven and works only while `vidId()` matches (aborts if the user navigates
   to another video); it only runs on `youtube.com/watch` pages.
 - Transcoding (H.264, mp3) is single-threaded ffmpeg.wasm — can take minutes on long videos.
+- **A clip could come back with a HOLE inside the requested range (fixed 2026-10-13)**: a 0:00-0:50
+  download carried an audio gap of exactly `10.02 s at 40.001 s` (one Opus segment; the reported
+  symptom) while the UI still said «Готово». Mechanism, measured in the lab: before recording,
+  `playthrough()` runs its flush dance — it seeks to `preSeek = min(35, dur-5)`, which for a download
+  starting at 0 is INSIDE the range — and re-selects the target quality there, so the player fetches
+  segments at ~35 s. Those appends arrive with `store.capturing === false`, are never recorded, and the
+  player will not append them a second time. The old completion rule read the UNION edge
+  (`v.buffered`), so the loop hopped straight over that window and declared success.
+  Fix, ported from upstream `ff60ae8` (v1.4.6, "Capture the whole requested range, or say it failed")
+  plus our per-track work: coverage comes from each track's OWN SourceBuffer (`coveredTo(kind, t)`),
+  both tracks must reach the end, hops go to the contiguous frontier only, a persistent plateau
+  escalates to `v.play()` for a moment (upstream measured that a paused player sometimes stops
+  fetching and a forward seek does NOT revive it — reproduced here: a +3 s seek left the buffer frozen
+  for 20+ s), and the range is re-verified after the loop, so an incomplete capture FAILS with
+  «получено до M:SS из M:SS» instead of shipping a holed clip.
+  Measured after the fix (Chrome for Testing 137, VISIBLE window): 0-170 s captures in **7.3 s** with
+  `complete: true`, and a UI download of 0:00-0:50 yields `gaps=none` on both streams (before the fix:
+  audio `{at: 40.001, delta: 10.02}`).
+- **Do NOT evict the capture range from the player's SourceBuffers** (tried, measured, rejected):
+  `sb.remove(capStart, capEnd)` before recording does hide the stale window, but the player then has to
+  resume from a buffer we emptied and dies the moment unsticking playback starts —
+  `getVideoData().errorCode === 'ump.spsrejectfailure'` (YouTube maps it to
+  `HTML5_SPS_UMP_STATUS_REJECTED`, the branch next to `rc === 429`), duration → null, `currentTime` → 0,
+  player state -1, and the capture that otherwise races ahead plateaus at the buffer limit. The capture
+  loop handles the same window without touching the player's buffers.
+- **Every new exit path must leave `frontier` at the coverage it proved** (own port bug, same day):
+  the loop broke on `both >= capEnd - 0.5` without writing `frontier`, so the post-loop check
+  (`frontier >= capEnd - 0.5`) read the previous hop and a capture that HAD covered the whole range
+  failed with «получено до 2:45 из 2:50» on a 2:50 request. Verified live both ways.
+- **Our fork is behind upstream `HelpFreedom/Triangle-Downloader`**: fork base `85fde98` (v1.4.3);
+  upstream has since shipped `ff8cf5c` (v1.4.4, "Invalid filename" on titles with emoji), `abeffef`
+  (v1.4.5, audio/video drift in downloaded fragments) and `ff60ae8` (v1.4.6, the capture fix above).
+  Both lines number past v1.4.3 (our v1.4.4-1.5.1 vs upstream v1.4.4-1.4.6), so compare upstream
+  COMMITS, not the version number, before touching the capture path. `git fetch origin` can time out in
+  this shell; `curl -sS https://github.com/HelpFreedom/Triangle-Downloader/commit/<sha>.patch` works,
+  and upstream issues #6/#7 are the user-visible reports this bug produced.
+- **Lab probes must wait for three separate things** (skipping this looks like an "environment quirk"):
+  the watch page builds `#movie_player` asynchronously, the MAIN-world hook installs on its own schedule
+  (prove it with the `cmd:'info'` bridge message), and a fresh profile starts with playback stopped
+  (`player.playVideo()` + `v.muted = true; await v.play()` before waiting for `duration > 0`). Headless
+  vs visible was NOT a variable: the same code produced the same capture behaviour in both.
